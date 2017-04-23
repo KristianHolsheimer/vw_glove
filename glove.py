@@ -6,6 +6,7 @@ import pandas as pd
 import re
 import sys
 
+from csv import QUOTE_NONE
 from bs4 import BeautifulSoup
 from collections import Iterable, defaultdict
 from itertools import islice
@@ -54,9 +55,8 @@ class GloVe:
     Main class for computing GloVe word embeddings.
 
     """
-    def __init__(self, n_dimensions=10, random_state=None):
+    def __init__(self, n_dimensions=10):
         self.n_dimensions = n_dimensions
-        self.random_state = random_state
 
     def get_cooccurrence_info(self, docs):
         """
@@ -283,7 +283,7 @@ class GloVe:
             .sort_values('cooccurrence', ascending=False)
         )
 
-    def vw_lines(self, shuffle=True, truncate=None):
+    def vw_lines(self, shuffle=True, random_state=None, truncate=None):
         """
         Generator that yields Vowpal Wabbit formatted labeled example lines.
 
@@ -304,7 +304,7 @@ class GloVe:
         vw_template = "{0:f} {1:f} |u {2:d} |v {3:d}"
         series = self.cooccurrence_counts_.iloc[:truncate, 0]
         if shuffle:
-            series = series.sample(frac=1, random_state=self.random_state)
+            series = series.sample(frac=1, random_state=random_state)
 
         def fudge_factor(x, alpha=0.75, x_max=10):
             """ GloVe heuristic sample weights """
@@ -395,15 +395,23 @@ class GloVe:
             available.
 
         """
-        if not hasattr(self, 'word_vectors_') or refresh:
-            with NamedTemporaryFile(prefix='glove_model_', suffix='.vw') as f:
-                self._train_word_vectors(f.name)
-                latent_factors = self._extract_word_vectors(f.name)
+        if hasattr(self, 'word_vectors_') or refresh:
+            print >> sys.stderr, (
+                "Word vectors are already available; set refresh=True if you "
+                "wish to re-compute the word vectors.")
+            return
 
-            latent_factors = pd.Series(latent_factors)
-            latent_factors.index.names = 'token_id', 'vector_index'
-            latent_factors.sort_index(inplace=True)
-            self.word_vectors_ = latent_factors.unstack(level='vector_index')
+        with NamedTemporaryFile(prefix='glove_model_', suffix='.vw') as f:
+            self._train_word_vectors(f.name)
+            latent_factors = self._extract_word_vectors(f.name)
+
+        latent_factors = pd.Series(latent_factors)
+        latent_factors.index.names = 'token_id', 'vector_index'
+        latent_factors.sort_index(inplace=True)
+
+        latent_factors = latent_factors.unstack(level='vector_index')
+        self.word_vectors = (
+            latent_factors.join(self.token_dictionary_inv_).set_index('token'))
 
     def save(self, filepath_or_buffer):
         """
@@ -415,9 +423,12 @@ class GloVe:
             Any object that ``pandas.to_csv()`` can write to.
 
         """
-        self.word_vectors_.to_csv(filepath_or_buffer)
+        formatted = self.word_vectors_word_vectors.applymap("{:.6f}".format)
+        formatted.to_csv(
+            filepath_or_buffer, sep=' ', header=None, quoting=QUOTE_NONE)
 
-    def load(self, filepath_or_buffer):
+    @classmethod
+    def load(cls, filepath_or_buffer):
         """
         Load word embeddings from a csv file.
 
@@ -427,7 +438,14 @@ class GloVe:
             Any object that ``pandas.to_csv()`` can read from.
 
         """
-        self.word_vectors_ = pd.read_csv(filepath_or_buffer)
+        word_vectors = pd.read_csv(
+            filepath_or_buffer, sep=' ',
+            quoting=QUOTE_NONE, index_col=0, header=None)
+        word_vectors.columns = np.arange(word_vectors.shape[1])
+        word_vectors.index.name = 'token'
+        self = cls(n_dimensions=word_vectors.shape[1])
+        self.word_vectors_ = word_vectors
+        return self
 
 
 def _get_latent_factors(line, latent_factors):
@@ -436,7 +454,7 @@ def _get_latent_factors(line, latent_factors):
         info = info.split(':')
         i, token_id = info[0].split('^')
 
-        i = int(i[1:])            # vector index of latent factors
+        i = int(i[1:]) - 1        # vector index of latent factors
         token_id = int(token_id)  # token_id
         u = float(info[3])        # vector entry of u factor
         v = float(info[7])        # vector entry of v factor
